@@ -134,6 +134,7 @@ def get_app_categories():
         "system": {
             "apps": [
                 "com.google.android.gms",   # Google Play Services
+                "com.android.vending",      # Google Play Store
                 "com.samsung",              # 삼성 앱들
                 "com.sec.",                 # 삼성 시스템 앱들
                 "android",                  # 시스템 앱들
@@ -143,7 +144,7 @@ def get_app_categories():
     }
 
 def find_database_files(mount_point):
-    """개선된 DB 검색 - 서드파티 앱 우선"""
+    """개선된 DB 검색 - 서드파티 앱 우선, 다중 검색 방법 사용"""
     db_paths = []
     root_data = os.path.join(mount_point, "data")
     
@@ -156,44 +157,44 @@ def find_database_files(mount_point):
     
     app_categories = get_app_categories()
     
-    # 1단계: 실제 존재하는 앱 폴더들 찾기
-    print("\n[+] 1단계: 앱 폴더 검색...")
+    # 1단계: 직접 ls를 이용한 앱 폴더 검색 (더 안정적)
+    print("\n[+] 1단계: 앱 폴더 직접 검색...")
+    app_folders = []
     try:
-        # /data 바로 아래의 모든 폴더 검색
-        find_apps_cmd = [
-            "sudo", "find", root_data,
-            "-maxdepth", "1",
-            "-type", "d", 
-            "-name", "*.*"   # 패키지명 형태의 폴더들
-        ]
+        ls_result = subprocess.run(
+            ["sudo", "ls", "-la", root_data],
+            capture_output=True, text=True, timeout=30
+        )
         
-        result = subprocess.run(find_apps_cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0 and result.stdout.strip():
-            app_folders = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+        if ls_result.returncode == 0:
+            lines = ls_result.stdout.strip().split('\n')
+            
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 9 and parts[0].startswith('d'):  # 디렉토리만
+                    folder_name = parts[-1]
+                    if '.' in folder_name and folder_name not in ['.', '..']:  # 패키지명 형태
+                        full_path = os.path.join(root_data, folder_name)
+                        app_folders.append((folder_name, full_path))
+            
             print(f"[+] 발견된 앱 폴더: {len(app_folders)}개")
             
-            # 카테고리별로 분류
-            categorized_apps = {}
-            for category, info in app_categories.items():
-                categorized_apps[category] = []
-                
+            # 카테고리별로 분류하여 출력
+            categorized_apps = {cat: [] for cat in app_categories.keys()}
             uncategorized = []
             
-            for folder in app_folders:
-                app_name = os.path.basename(folder)
+            for app_name, folder_path in app_folders:
                 categorized = False
-                
                 for category, info in app_categories.items():
                     if any(app_pattern in app_name for app_pattern in info["apps"]):
-                        categorized_apps[category].append((app_name, folder))
+                        categorized_apps[category].append((app_name, folder_path))
                         categorized = True
                         break
                 
                 if not categorized:
-                    uncategorized.append((app_name, folder))
+                    uncategorized.append((app_name, folder_path))
             
-            # 카테고리별 출력 (우선순위 순)
+            # 우선순위 순으로 출력
             sorted_categories = sorted(app_categories.items(), key=lambda x: x[1]["priority"])
             
             for category, info in sorted_categories:
@@ -204,76 +205,112 @@ def find_database_files(mount_point):
             
             if uncategorized:
                 print(f"\n  📱 기타 앱 ({len(uncategorized)}개):")
-                for app_name, folder in uncategorized[:10]:
+                for app_name, folder in uncategorized[:15]:  # 처음 15개만 표시
                     print(f"    - {app_name}")
-                if len(uncategorized) > 10:
-                    print(f"    ... 및 {len(uncategorized)-10}개 더")
+                if len(uncategorized) > 15:
+                    print(f"    ... 및 {len(uncategorized)-15}개 더")
                     
         else:
-            print("[경고] 앱 폴더 검색 실패")
+            print(f"[경고] ls 명령 실패: {ls_result.stderr}")
             
     except Exception as e:
         print(f"[경고] 앱 폴더 검색 오류: {e}")
     
-    # 2단계: databases 폴더 검색 및 DB 파일 수집
-    print(f"\n[+] 2단계: 서드파티 앱 DB 파일 검색...")
+    # 2단계: 서드파티 앱 우선 DB 검색 - 개별 앱 폴더 직접 검사
+    print(f"\n[+] 2단계: 서드파티 앱 우선 개별 검사...")
     
-    try:
-        find_databases_cmd = [
-            "sudo", "find", root_data,
-            "-type", "d",
-            "-name", "databases",
-            "-maxdepth", "3"
-        ]
+    # DB 파일 정보를 저장할 리스트
+    db_info_list = []
+    
+    # 우선순위 앱들을 먼저 검사
+    priority_apps = []
+    for category, info in app_categories.items():
+        if info["priority"] <= 2:  # 고우선순위만
+            for app_pattern in info["apps"]:
+                for app_name, folder_path in app_folders:
+                    if app_pattern in app_name:
+                        priority_apps.append((app_name, folder_path, category, info["priority"]))
+    
+    print(f"  우선 검사할 서드파티 앱: {len(priority_apps)}개")
+    
+    # 우선순위 앱들 개별 검사
+    for app_name, app_path, category, priority in priority_apps:
+        print(f"    🔍 {app_name} 개별 검사...")
         
-        result = subprocess.run(find_databases_cmd, capture_output=True, text=True, timeout=60)
-        
-        if result.returncode == 0 and result.stdout.strip():
-            databases_folders = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
-            print(f"[+] 발견된 databases 폴더: {len(databases_folders)}개")
+        # databases 폴더 직접 확인
+        databases_path = os.path.join(app_path, "databases")
+        try:
+            ls_db_result = subprocess.run(
+                ["sudo", "ls", "-la", databases_path],
+                capture_output=True, text=True, timeout=10
+            )
             
-            # DB 파일 정보를 저장할 리스트
-            db_info_list = []
-            
-            for db_folder in databases_folders:
-                if os.path.exists(db_folder):
-                    rel_path = os.path.relpath(db_folder, root_data)
-                    app_name = rel_path.split('/')[0]
-                    
-                    try:
-                        find_db_cmd = [
-                            "sudo", "find", db_folder,
-                            "-type", "f",
-                            "-name", "*.db",
-                            "-size", "+0c"
-                        ]
-                        
-                        db_result = subprocess.run(find_db_cmd, capture_output=True, text=True, timeout=15)
-                        
-                        if db_result.returncode == 0 and db_result.stdout.strip():
-                            found_dbs = [f.strip() for f in db_result.stdout.strip().split('\n') if f.strip()]
+            if ls_db_result.returncode == 0:
+                print(f"      ✓ databases 폴더 발견")
+                lines = ls_db_result.stdout.strip().split('\n')
+                db_count = 0
+                
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) >= 9 and not parts[0].startswith('d'):  # 파일만
+                        filename = parts[-1]
+                        if filename.endswith('.db') and filename not in ['.', '..']:
+                            db_file_path = os.path.join(databases_path, filename)
                             
+                            # 파일 크기 확인
+                            try:
+                                stat_result = subprocess.run(
+                                    ["sudo", "stat", "-c", "%s", db_file_path],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                size_bytes = int(stat_result.stdout.strip()) if stat_result.returncode == 0 else 0
+                            except:
+                                size_bytes = 0
+                            
+                            db_info_list.append({
+                                "path": db_file_path,
+                                "app_name": app_name,
+                                "db_name": filename,
+                                "size_bytes": size_bytes,
+                                "category": category,
+                                "priority": priority
+                            })
+                            
+                            db_count += 1
+                            print(f"        🗃️  {filename} ({size_bytes} bytes)")
+                
+                if db_count == 0:
+                    print(f"      ⚠️  databases 폴더가 비어있음")
+            else:
+                print(f"      ❌ databases 폴더 없음")
+                
+                # databases 폴더가 없으면 다른 가능한 위치들 검사
+                possible_paths = [
+                    os.path.join(app_path, "files"),
+                    os.path.join(app_path, "shared_prefs"),
+                    app_path  # 앱 루트 폴더
+                ]
+                
+                for check_path in possible_paths:
+                    try:
+                        find_result = subprocess.run(
+                            ["sudo", "find", check_path, "-name", "*.db", "-type", "f", "-maxdepth", "2"],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        
+                        if find_result.returncode == 0 and find_result.stdout.strip():
+                            found_dbs = find_result.stdout.strip().split('\n')
                             for db_file in found_dbs:
                                 if db_file and os.path.exists(db_file):
                                     # 파일 크기 확인
                                     try:
                                         stat_result = subprocess.run(
                                             ["sudo", "stat", "-c", "%s", db_file],
-                                            capture_output=True, text=True
+                                            capture_output=True, text=True, timeout=5
                                         )
                                         size_bytes = int(stat_result.stdout.strip()) if stat_result.returncode == 0 else 0
                                     except:
                                         size_bytes = 0
-                                    
-                                    # 앱 카테고리 확인
-                                    category = "uncategorized"
-                                    priority = 5
-                                    
-                                    for cat, info in app_categories.items():
-                                        if any(app_pattern in app_name for app_pattern in info["apps"]):
-                                            category = cat
-                                            priority = info["priority"]
-                                            break
                                     
                                     db_info_list.append({
                                         "path": db_file,
@@ -284,15 +321,97 @@ def find_database_files(mount_point):
                                         "priority": priority
                                     })
                                     
+                                    rel_path = os.path.relpath(db_file, app_path)
+                                    print(f"        🗃️  {rel_path} ({size_bytes} bytes)")
+                            break
+                    except:
+                        continue
+                        
+        except Exception as e:
+            print(f"      ❌ 검사 실패: {e}")
+    
+    # 3단계: 전체 find 검색 (시스템 앱 포함)
+    print(f"\n[+] 3단계: 전체 시스템 DB 파일 검색...")
+    try:
+        # 방법 1: databases 폴더 검색
+        find_db_folders_cmd = [
+            "sudo", "find", root_data,
+            "-type", "d",
+            "-name", "databases",
+            "-maxdepth", "4"
+        ]
+        
+        result = subprocess.run(find_db_folders_cmd, capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            databases_folders = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+            print(f"    발견된 databases 폴더: {len(databases_folders)}개")
+            
+            for db_folder in databases_folders:
+                if os.path.exists(db_folder):
+                    rel_path = os.path.relpath(db_folder, root_data)
+                    app_name = rel_path.split('/')[0]
+                    
+                    # 이미 처리된 앱인지 확인
+                    already_processed = any(db["app_name"] == app_name for db in db_info_list)
+                    if already_processed:
+                        continue
+                    
+                    try:
+                        # ls로 DB 파일 검색
+                        ls_db_result = subprocess.run(
+                            ["sudo", "ls", "-la", db_folder],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        
+                        if ls_db_result.returncode == 0:
+                            lines = ls_db_result.stdout.strip().split('\n')
+                            for line in lines:
+                                parts = line.split()
+                                if len(parts) >= 9 and not parts[0].startswith('d'):  # 파일만
+                                    filename = parts[-1]
+                                    if filename.endswith('.db') and filename not in ['.', '..']:
+                                        db_file_path = os.path.join(db_folder, filename)
+                                        
+                                        # 파일 크기 확인
+                                        try:
+                                            stat_result = subprocess.run(
+                                                ["sudo", "stat", "-c", "%s", db_file_path],
+                                                capture_output=True, text=True, timeout=5
+                                            )
+                                            size_bytes = int(stat_result.stdout.strip()) if stat_result.returncode == 0 else 0
+                                        except:
+                                            size_bytes = 0
+                                        
+                                        # 앱 카테고리 확인
+                                        category = "uncategorized"
+                                        priority = 5
+                                        
+                                        for cat, info in app_categories.items():
+                                            if any(app_pattern in app_name for app_pattern in info["apps"]):
+                                                category = cat
+                                                priority = info["priority"]
+                                                break
+                                        
+                                        db_info_list.append({
+                                            "path": db_file_path,
+                                            "app_name": app_name,
+                                            "db_name": filename,
+                                            "size_bytes": size_bytes,
+                                            "category": category,
+                                            "priority": priority
+                                        })
+                                        
                     except subprocess.TimeoutExpired:
-                        print(f"   ? {app_name}: DB 검색 타임아웃")
+                        print(f"      ? {app_name}: DB 검색 타임아웃")
                     except Exception as e:
-                        print(f"   ? {app_name}: DB 검색 실패 ({e})")
-            
-            # 우선순위 기준으로 정렬 (서드파티 앱 우선)
-            db_info_list.sort(key=lambda x: (x["priority"], -x["size_bytes"]))
-            
-            # 결과 출력 및 경로 리스트 생성
+                        print(f"      ? {app_name}: DB 검색 실패 ({e})")
+        
+        # 우선순위 기준으로 정렬 (서드파티 앱 우선)
+        db_info_list.sort(key=lambda x: (x["priority"], -x["size_bytes"]))
+        
+        # 결과 출력 및 경로 리스트 생성
+        if db_info_list:
             print(f"\n[+] DB 파일 분석 우선순위:")
             current_category = None
             
@@ -301,7 +420,7 @@ def find_database_files(mount_point):
                     current_category = db_info["category"]
                     print(f"\n  📊 {current_category.upper()}:")
                 
-                size_kb = db_info["size_bytes"] / 1024
+                size_kb = db_info["size_bytes"] / 1024 if db_info["size_bytes"] > 0 else 0
                 marker = "🔥" if db_info["priority"] <= 2 else "  "
                 print(f"{marker} {db_info['app_name']}/{db_info['db_name']} ({size_kb:.1f} KB)")
                 
@@ -314,12 +433,11 @@ def find_database_files(mount_point):
             print(f"\n[+] 총 {len(db_info_list)}개 DB 파일 발견")
             print(f"[+] 총 DB 파일 크기: {total_size / 1024 / 1024:.2f} MB")
             print(f"[+] 고우선순위 서드파티 앱 DB: {high_priority_count}개 ⭐")
-            
         else:
-            print(f"[경고] databases 폴더를 찾을 수 없습니다")
+            print(f"[경고] DB 파일을 찾을 수 없습니다")
             
     except Exception as e:
-        print(f"[경고] databases 폴더 검색 오류: {e}")
+        print(f"[경고] DB 파일 검색 오류: {e}")
     
     return db_paths
 
@@ -347,7 +465,7 @@ def get_important_tables_by_app(app_name):
     return None  # 모든 테이블 분석
 
 def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
-    """개선된 DB 분석 - 앱별 중요 테이블 우선"""
+    """개선된 DB 분석 - 앱별 중요 테이블 우선, 한글 데이터 최우선"""
     summary = []
     copied_db = None
     
@@ -403,18 +521,72 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
                 # 데이터 샘플
                 cur.execute(f"SELECT * FROM {table} LIMIT {row_limit};")
                 rows = cur.fetchall()
+
+                # 한글 및 이메일 포함 여부 판단
+                has_korean = False
+                has_email = False
+                korean_count = 0
+                email_count = 0
+                
+                if rows:
+                    for row in rows:
+                        for col in row:
+                            if isinstance(col, str):
+                                # 한글 유니코드 범위 검사 (가-힣, ㄱ-ㅎ, ㅏ-ㅣ)
+                                korean_chars = sum(1 for char in col if '\uac00' <= char <= '\ud7a3' or '\u1100' <= char <= '\u11ff' or '\u3130' <= char <= '\u318f')
+                                if korean_chars > 0:
+                                    has_korean = True
+                                    korean_count += korean_chars
+                                
+                                # 이메일 패턴 검사
+                                import re
+                                email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+                                emails = re.findall(email_pattern, col)
+                                if emails:
+                                    has_email = True
+                                    email_count += len(emails)
+                
+                # 포렌식적으로 의미없는 테이블 필터링 (더 엄격하게)
+                forensic_irrelevant_patterns = [
+                    'cache', 'temp', 'tmp', 'log', 'debug', 'analytics', 'crash',
+                    'session', 'preference', 'config', 'setting', 'metadata',
+                    'index', 'fts', 'search', 'sync', 'backup', 'trash',
+                    'android_', 'sqlite_', 'room_', 'dagger_', 'hilt_',
+                    'overrides', 'saved_secure', 'saved_global', 'secure',
+                    'system', 'global', 'default', 'properties', 'flags',
+                    'state', 'status', 'info', 'data', 'values', 'settings'
+                ]
+                
+                is_forensic_irrelevant = any(pattern in table.lower() for pattern in forensic_irrelevant_patterns)
                 
                 # 중요한 테이블인지 표시
                 is_important = False
                 if important_patterns:
                     is_important = any(pattern.lower() in table.lower() for pattern in important_patterns)
                 
+                # 포렌식 우선순위 계산 (한글/이메일 > 중요 > 기타 > 무관)
+                forensic_priority = 0
+                if has_korean or has_email:
+                    forensic_priority = 3  # 최우선 (한글 또는 이메일)
+                elif is_important:
+                    forensic_priority = 2  # 고우선순위
+                elif not is_forensic_irrelevant:
+                    forensic_priority = 1  # 일반
+                else:
+                    forensic_priority = 0  # 무관
+                
                 summary.append({
                     "table": table, 
                     "columns": columns, 
                     "rows": rows,
                     "row_count": row_count,
-                    "is_important": is_important
+                    "is_important": is_important,
+                    "has_korean": has_korean,
+                    "has_email": has_email,
+                    "korean_count": korean_count,
+                    "email_count": email_count,
+                    "is_forensic_irrelevant": is_forensic_irrelevant,
+                    "forensic_priority": forensic_priority
                 })
                 
             except Exception as table_error:
@@ -423,7 +595,13 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
                     "columns": [], 
                     "rows": [f"테이블 분석 오류: {str(table_error)}"],
                     "row_count": 0,
-                    "is_important": False
+                    "is_important": False,
+                    "has_korean": False,
+                    "has_email": False,
+                    "korean_count": 0,
+                    "email_count": 0,
+                    "is_forensic_irrelevant": False,
+                    "forensic_priority": 0
                 })
                 
     except Exception as e:
@@ -432,7 +610,13 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
             "columns": [], 
             "rows": [f"DB 연결 오류: {str(e)}"],
             "row_count": 0,
-            "is_important": False
+            "is_important": False,
+            "has_korean": False,
+            "has_email": False,
+            "korean_count": 0,
+            "email_count": 0,
+            "is_forensic_irrelevant": False,
+            "forensic_priority": 0
         })
     finally:
         try: 
@@ -450,16 +634,42 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
     return summary
 
 def generate_markdown_report(db_summaries, output_path, mount_point):
-    """개선된 마크다운 보고서 생성"""
+    """개선된 마크다운 보고서 생성 - 포렌식적으로 의미있는 데이터만 포함, 한글 데이터 최우선"""
     app_categories = get_app_categories()
     
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("# Wear OS 서드파티 앱 DB 아티팩트 분석 리포트\n\n")
-        f.write("이 보고서는 서드파티 앱의 데이터베이스를 우선 분석한 결과입니다.\n\n")
+        f.write("이 보고서는 **포렌식적으로 의미있는** 서드파티 앱의 데이터베이스 테이블만을 분석한 결과입니다.\n")
+        f.write("**한글 데이터와 이메일 주소가 포함된 테이블만 표시됩니다.**\n\n")
         
         # 요약 섹션
         f.write("## 📊 분석 요약\n\n")
         total_dbs = len(db_summaries)
+        
+        # 통계 계산
+        total_tables = 0
+        tables_with_data = 0
+        total_rows = 0
+        korean_tables = 0
+        email_tables = 0
+        forensic_relevant_tables = 0
+        
+        for db_file, tables in db_summaries.items():
+            for table_info in tables:
+                if table_info.get('table') not in ['DB_ERROR', 'COPY_ERROR']:
+                    total_tables += 1
+                    row_count = table_info.get('row_count', 0)
+                    if row_count > 0:
+                        tables_with_data += 1
+                        total_rows += row_count
+                        
+                        # 포렌식 관련성 및 한글/이메일 데이터 통계
+                        if table_info.get('has_korean', False):
+                            korean_tables += 1
+                        if table_info.get('has_email', False):
+                            email_tables += 1
+                        if table_info.get('forensic_priority', 0) > 0:
+                            forensic_relevant_tables += 1
         
         # 카테고리별 통계
         category_stats = {}
@@ -478,8 +688,15 @@ def generate_markdown_report(db_summaries, output_path, mount_point):
             category_stats[category] += 1
         
         f.write(f"- **총 분석된 DB 파일**: {total_dbs}개\n")
+        f.write(f"- **총 테이블 수**: {total_tables}개\n")
+        f.write(f"- **데이터가 있는 테이블**: {tables_with_data}개 ({tables_with_data/total_tables*100:.1f}%)\n")
+        f.write(f"- **포렌식 관련 테이블**: {forensic_relevant_tables}개 ⭐\n")
+        f.write(f"- **한글 데이터 포함 테이블**: {korean_tables}개 🇰🇷\n")
+        f.write(f"- **이메일 주소 포함 테이블**: {email_tables}개 📧\n")
+        f.write(f"- **총 데이터 레코드**: {total_rows:,}개\n\n")
+        
         for category, count in sorted(category_stats.items()):
-            f.write(f"- **{category.title()}**: {count}개\n")
+            f.write(f"- **{category.title()}**: {count}개 DB\n")
         f.write("\n")
         
         # 카테고리별로 정렬해서 출력
@@ -514,34 +731,85 @@ def generate_markdown_report(db_summaries, output_path, mount_point):
                 rel_db_path = os.path.relpath(db_file, os.path.join(mount_point, "data"))
                 app_name = rel_db_path.split('/')[0]
                 
+                # 한글/이메일 데이터가 있는 테이블들만 필터링
+                korean_tables_with_data = []
+                email_tables_with_data = []
+                other_relevant_tables = []
+                
+                for table_info in tables:
+                    # 오류 테이블이거나 데이터가 없는 테이블은 건너뛰기
+                    if table_info.get('table') in ['DB_ERROR', 'COPY_ERROR']:
+                        continue
+                    
+                    row_count = table_info.get('row_count', 0)
+                    has_data = row_count > 0
+                    forensic_priority = table_info.get('forensic_priority', 0)
+                    
+                    # 한글/이메일 데이터가 없는 테이블은 제외
+                    if not has_data or not (table_info.get('has_korean', False) or table_info.get('has_email', False)):
+                        continue
+                    
+                    if table_info.get('has_korean', False):
+                        korean_tables_with_data.append(table_info)
+                    elif table_info.get('has_email', False):
+                        email_tables_with_data.append(table_info)
+                    else:
+                        other_relevant_tables.append(table_info)
+                
+                # 한글/이메일 데이터가 있는 테이블이 하나도 없으면 이 DB는 건너뛰기
+                if not korean_tables_with_data and not email_tables_with_data and not other_relevant_tables:
+                    continue
+                
                 # 우선순위 표시
                 priority_marker = {1: "🔥 고우선순위", 2: "⭐ 중우선순위", 3: "📍 저우선순위"}.get(priority, "")
                 
                 f.write(f"### {priority_marker} `/data/{rel_db_path}`\n\n")
-                f.write(f"**앱**: `{app_name}`\n\n")
+                f.write(f"**앱**: `{app_name}`\n")
                 
-                # 중요한 테이블과 일반 테이블 분리
-                important_tables = [t for t in tables if t.get("is_important", False)]
-                other_tables = [t for t in tables if not t.get("is_important", False)]
+                # 테이블 통계 표시
+                total_relevant_tables = len(korean_tables_with_data) + len(email_tables_with_data) + len(other_relevant_tables)
+                total_rows_in_db = sum(t.get('row_count', 0) for t in korean_tables_with_data + email_tables_with_data + other_relevant_tables)
+                f.write(f"**한글/이메일 데이터 테이블**: {total_relevant_tables}개 ({total_rows_in_db:,}행)\n")
                 
-                if important_tables:
-                    f.write("#### 🔥 주요 데이터 테이블\n\n")
-                    for info in important_tables:
-                        write_table_info(f, info)
+                if korean_tables_with_data:
+                    f.write(f"**한글 데이터 테이블**: {len(korean_tables_with_data)}개 🇰🇷\n")
+                if email_tables_with_data:
+                    f.write(f"**이메일 데이터 테이블**: {len(email_tables_with_data)}개 📧\n")
+                f.write("\n")
                 
-                if other_tables:
-                    f.write("#### 📋 기타 테이블\n\n")
-                    for info in other_tables:
-                        write_table_info(f, info)
+                # 한글 데이터 테이블을 최우선으로 표시
+                if korean_tables_with_data:
+                    f.write("#### 🇰🇷 한글 데이터 테이블\n\n")
+                    for info in korean_tables_with_data:
+                        write_table_info(f, info, is_korean=True)
+                
+                # 이메일 데이터 테이블 표시
+                if email_tables_with_data:
+                    f.write("#### 📧 이메일 데이터 테이블\n\n")
+                    for info in email_tables_with_data:
+                        write_table_info(f, info, is_email=True)
                 
                 f.write("---\n\n")
 
-def write_table_info(f, info):
-    """테이블 정보를 마크다운으로 작성"""
+def write_table_info(f, info, is_korean=False, is_email=False):
+    """테이블 정보를 마크다운으로 작성 - 한글/이메일 데이터가 있는 테이블만"""
     table_name = info['table']
     row_count = info.get('row_count', 0)
+    korean_count = info.get('korean_count', 0)
+    email_count = info.get('email_count', 0)
     
-    f.write(f"##### 테이블: `{table_name}` ({row_count}행)\n\n")
+    # 한글/이메일 데이터 표시
+    if is_korean:
+        marker = "🇰🇷 "
+        info_text = f" (한글 {korean_count}자)" if korean_count > 0 else ""
+    elif is_email:
+        marker = "📧 "
+        info_text = f" (이메일 {email_count}개)" if email_count > 0 else ""
+    else:
+        marker = ""
+        info_text = ""
+    
+    f.write(f"##### {marker}테이블: `{table_name}` ({row_count}행{info_text})\n\n")
     
     if not info["columns"]:
         f.write("_컬럼 정보 없음 또는 오류 발생_\n\n")
@@ -551,7 +819,7 @@ def write_table_info(f, info):
         return
     
     # 데이터가 있는 경우에만 테이블 표시
-    if info["rows"]:
+    if info["rows"] and len(info["rows"]) > 0:
         # 테이블 헤더
         f.write("| " + " | ".join(info["columns"]) + " |\n")
         f.write("| " + " | ".join(["---"] * len(info["columns"])) + " |\n")
@@ -570,7 +838,8 @@ def write_table_info(f, info):
                     row_str.append(col_str)
             f.write("| " + " | ".join(row_str) + " |\n")
     else:
-        f.write("_데이터 없음_\n")
+        # 데이터가 없는 경우 간단한 메시지만
+        f.write("_데이터 없음 (테이블 스키마만 존재)_\n")
     
     f.write("\n")
 
@@ -608,6 +877,54 @@ def main():
         
         if not db_files:
             print("[경고] DB 파일이 탐지되지 않았습니다.")
+            
+            # 추가 디버깅 정보 제공
+            print("\n[디버깅] 추가 검사 수행...")
+            root_data = os.path.join(mount_point, "data")
+            
+            # /data 폴더 구조 확인
+            try:
+                ls_result = subprocess.run(
+                    ["sudo", "ls", "-la", root_data],
+                    capture_output=True, text=True, timeout=30
+                )
+                if ls_result.returncode == 0:
+                    print(f"[디버깅] /data 폴더 내용:")
+                    lines = ls_result.stdout.strip().split('\n')[:20]  # 처음 20줄만
+                    for line in lines:
+                        print(f"  {line}")
+                    if len(ls_result.stdout.strip().split('\n')) > 20:
+                        print("  ... (더 많은 폴더 있음)")
+            except Exception as e:
+                print(f"[디버깅] /data 폴더 확인 실패: {e}")
+            
+            # 특정 앱 폴더 직접 확인
+            test_apps = ["jp.naver.line.android", "com.google.android.keep", "com.coffeebeanventures.easyvoicerecorder"]
+            for app in test_apps:
+                app_path = os.path.join(root_data, app)
+                try:
+                    ls_app_result = subprocess.run(
+                        ["sudo", "ls", "-la", app_path],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if ls_app_result.returncode == 0:
+                        print(f"[디버깅] {app} 폴더 발견:")
+                        for line in ls_app_result.stdout.strip().split('\n')[:10]:
+                            print(f"  {line}")
+                        
+                        # databases 폴더 확인
+                        db_path = os.path.join(app_path, "databases")
+                        ls_db_result = subprocess.run(
+                            ["sudo", "ls", "-la", db_path],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if ls_db_result.returncode == 0:
+                            print(f"[디버깅] {app}/databases 폴더 내용:")
+                            for line in ls_db_result.stdout.strip().split('\n'):
+                                print(f"    {line}")
+                except:
+                    print(f"[디버깅] {app} 폴더 없음 또는 접근 불가")
+            
             return
         
         # DB 분석 (서드파티 앱 위주)
@@ -635,4 +952,4 @@ def main():
             print(f"[+] 임시 디렉토리 정리 완료")
 
 if __name__ == "__main__":
-    main()
+    main() 
