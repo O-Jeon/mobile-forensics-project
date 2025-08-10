@@ -5,6 +5,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import re
 
 def mount_img(img_path, mount_point):
     if not os.path.isfile(img_path):
@@ -142,6 +143,59 @@ def get_app_categories():
             "priority": 4  # 낮은 우선순위
         }
     }
+
+def has_korean_text(text):
+    """텍스트에 한글이 포함되어 있는지 확인"""
+    if not text:
+        return False
+    korean_pattern = re.compile(r'[가-힣]')
+    return bool(korean_pattern.search(str(text)))
+
+def has_email_pattern(text):
+    """텍스트에 이메일 패턴이 있는지 확인"""
+    if not text:
+        return False
+    email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+    return bool(email_pattern.search(str(text)))
+
+def count_korean_chars(text):
+    """텍스트의 한글 문자 수를 세기"""
+    if not text:
+        return 0
+    korean_pattern = re.compile(r'[가-힣]')
+    return len(korean_pattern.findall(str(text)))
+
+def extract_emails(text):
+    """텍스트에서 이메일 주소 추출"""
+    if not text:
+        return []
+    email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
+    return email_pattern.findall(str(text))
+
+def analyze_table_content(table_info):
+    """테이블 내용을 분석하여 한글/이메일 정보 추가"""
+    korean_count = 0
+    email_count = 0
+    has_korean = False
+    has_email = False
+    
+    if table_info.get("rows"):
+        for row in table_info["rows"]:
+            for cell in row:
+                cell_str = str(cell) if cell is not None else ""
+                if has_korean_text(cell_str):
+                    has_korean = True
+                    korean_count += count_korean_chars(cell_str)
+                if has_email_pattern(cell_str):
+                    has_email = True
+                    email_count += len(extract_emails(cell_str))
+    
+    table_info["has_korean"] = has_korean
+    table_info["has_email"] = has_email
+    table_info["korean_count"] = korean_count
+    table_info["email_count"] = email_count
+    
+    return table_info
 
 def find_database_files(mount_point):
     """개선된 DB 검색 - 서드파티 앱 우선, 다중 검색 방법 사용"""
@@ -465,7 +519,7 @@ def get_important_tables_by_app(app_name):
     return None  # 모든 테이블 분석
 
 def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
-    """개선된 DB 분석 - 앱별 중요 테이블 우선, 한글 데이터 최우선"""
+    """개선된 DB 분석 - 앱별 중요 테이블 우선, 한글/이메일 데이터 분석"""
     summary = []
     copied_db = None
     
@@ -521,73 +575,23 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
                 # 데이터 샘플
                 cur.execute(f"SELECT * FROM {table} LIMIT {row_limit};")
                 rows = cur.fetchall()
-
-                # 한글 및 이메일 포함 여부 판단
-                has_korean = False
-                has_email = False
-                korean_count = 0
-                email_count = 0
-                
-                if rows:
-                    for row in rows:
-                        for col in row:
-                            if isinstance(col, str):
-                                # 한글 유니코드 범위 검사 (가-힣, ㄱ-ㅎ, ㅏ-ㅣ)
-                                korean_chars = sum(1 for char in col if '\uac00' <= char <= '\ud7a3' or '\u1100' <= char <= '\u11ff' or '\u3130' <= char <= '\u318f')
-                                if korean_chars > 0:
-                                    has_korean = True
-                                    korean_count += korean_chars
-                                
-                                # 이메일 패턴 검사
-                                import re
-                                email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-                                emails = re.findall(email_pattern, col)
-                                if emails:
-                                    has_email = True
-                                    email_count += len(emails)
-                
-                # 포렌식적으로 의미없는 테이블 필터링 (더 엄격하게)
-                forensic_irrelevant_patterns = [
-                    'cache', 'temp', 'tmp', 'log', 'debug', 'analytics', 'crash',
-                    'session', 'preference', 'config', 'setting', 'metadata',
-                    'index', 'fts', 'search', 'sync', 'backup', 'trash',
-                    'android_', 'sqlite_', 'room_', 'dagger_', 'hilt_',
-                    'overrides', 'saved_secure', 'saved_global', 'secure',
-                    'system', 'global', 'default', 'properties', 'flags',
-                    'state', 'status', 'info', 'data', 'values', 'settings'
-                ]
-                
-                is_forensic_irrelevant = any(pattern in table.lower() for pattern in forensic_irrelevant_patterns)
                 
                 # 중요한 테이블인지 표시
                 is_important = False
                 if important_patterns:
                     is_important = any(pattern.lower() in table.lower() for pattern in important_patterns)
                 
-                # 포렌식 우선순위 계산 (한글/이메일 > 중요 > 기타 > 무관)
-                forensic_priority = 0
-                if has_korean or has_email:
-                    forensic_priority = 3  # 최우선 (한글 또는 이메일)
-                elif is_important:
-                    forensic_priority = 2  # 고우선순위
-                elif not is_forensic_irrelevant:
-                    forensic_priority = 1  # 일반
-                else:
-                    forensic_priority = 0  # 무관
-                
-                summary.append({
+                table_info = {
                     "table": table, 
                     "columns": columns, 
                     "rows": rows,
                     "row_count": row_count,
-                    "is_important": is_important,
-                    "has_korean": has_korean,
-                    "has_email": has_email,
-                    "korean_count": korean_count,
-                    "email_count": email_count,
-                    "is_forensic_irrelevant": is_forensic_irrelevant,
-                    "forensic_priority": forensic_priority
-                })
+                    "is_important": is_important
+                }
+                
+                # 한글/이메일 데이터 분석 추가
+                table_info = analyze_table_content(table_info)
+                summary.append(table_info)
                 
             except Exception as table_error:
                 summary.append({
@@ -599,9 +603,7 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
                     "has_korean": False,
                     "has_email": False,
                     "korean_count": 0,
-                    "email_count": 0,
-                    "is_forensic_irrelevant": False,
-                    "forensic_priority": 0
+                    "email_count": 0
                 })
                 
     except Exception as e:
@@ -614,9 +616,7 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
             "has_korean": False,
             "has_email": False,
             "korean_count": 0,
-            "email_count": 0,
-            "is_forensic_irrelevant": False,
-            "forensic_priority": 0
+            "email_count": 0
         })
     finally:
         try: 
@@ -633,215 +633,499 @@ def analyze_sqlite_db(db_path, app_name=None, row_limit=10, temp_dir=None):
     
     return summary
 
+def generate_html_report(db_summaries, output_path, mount_point):
+    """HTML GUI 증거 카드형 보고서 생성"""
+    app_categories = get_app_categories()
+    
+    # 전체 통계 계산
+    total_dbs = len(db_summaries)
+    total_tables = 0
+    tables_with_data = 0
+    total_rows = 0
+    korean_tables = 0
+    email_tables = 0
+    total_korean_chars = 0
+    total_emails = 0
+    
+    # 주요 계정 정보 추출
+    main_account = None
+    
+    # 증거 데이터 수집
+    evidence_items = []
+    evidence_counter = 1
+    
+    for db_file, tables in db_summaries.items():
+        rel_path = os.path.relpath(db_file, os.path.join(mount_point, "data"))
+        app_name = rel_path.split('/')[0]
+        
+        # 카테고리 확인
+        category = "기타"
+        priority = 5
+        for cat, info in app_categories.items():
+            if any(app_pattern in app_name for app_pattern in info["apps"]):
+                category = cat
+                priority = info["priority"]
+                break
+        
+        # 의미 있는 데이터가 있는 테이블들만 수집
+        important_data = []
+        other_data = []
+        
+        for table_info in tables:
+            if table_info.get('table') in ['DB_ERROR', 'COPY_ERROR']:
+                continue
+            
+            total_tables += 1
+            row_count = table_info.get('row_count', 0)
+            
+            if row_count > 0:
+                tables_with_data += 1
+                total_rows += row_count
+                
+                # 한글/이메일 데이터 통계
+                if table_info.get('has_korean'):
+                    korean_tables += 1
+                    total_korean_chars += table_info.get('korean_count', 0)
+                
+                if table_info.get('has_email'):
+                    email_tables += 1
+                    total_emails += table_info.get('email_count', 0)
+                
+                # 주요 계정 정보 추출 (이메일 패턴)
+                if not main_account and table_info.get('has_email'):
+                    for row in table_info.get('rows', []):
+                        for cell in row:
+                            cell_str = str(cell) if cell is not None else ""
+                            emails = extract_emails(cell_str)
+                            if emails and not any(x in emails[0] for x in ['noreply', 'no-reply', 'support']):
+                                main_account = emails[0]
+                                break
+                        if main_account:
+                            break
+                
+                # 중요도에 따라 분류
+                if table_info.get("is_important", False) or table_info.get('has_korean') or table_info.get('has_email'):
+                    important_data.append(table_info)
+                else:
+                    other_data.append(table_info)
+        
+        # 증거로 등록할 만한 데이터가 있으면 추가
+        if important_data or (priority <= 2 and other_data):
+            # 실제 의미있는 데이터가 있는지 확인
+            has_meaningful_data = False
+            
+            # 한글 또는 이메일 데이터가 있는지 확인
+            korean_data = [t for t in important_data + other_data if t.get('has_korean')]
+            email_data = [t for t in important_data + other_data if t.get('has_email')]
+            
+            # 한글/이메일 데이터가 있거나, 높은 우선순위 앱에서 상당한 데이터가 있는 경우만 포함
+            if korean_data or email_data:
+                has_meaningful_data = True
+            elif priority <= 2 and sum(t.get('row_count', 0) for t in important_data + other_data) >= 50:
+                has_meaningful_data = True
+            
+            if has_meaningful_data:
+                evidence_items.append({
+                    "id": evidence_counter,
+                    "app_name": app_name,
+                    "db_path": rel_path,
+                    "category": category,
+                    "priority": priority,
+                    "important_tables": important_data,
+                    "other_tables": other_data,
+                    "total_rows": sum(t.get('row_count', 0) for t in important_data + other_data),
+                    "korean_data": korean_data,
+                    "email_data": email_data
+                })
+                evidence_counter += 1
+    
+    # 우선순위로 정렬
+    evidence_items.sort(key=lambda x: (x["priority"], -x["total_rows"]))
+    
+    # HTML 생성
+    html_content = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wear OS 디지털 증거</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
+            font-family: 'Segoe UI', sans-serif; 
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .evidence-container {{ 
+            max-width: 1200px; 
+            margin: 0 auto; 
+        }}
+        .header {{ 
+            text-align: center; 
+            margin-bottom: 40px;
+            color: white;
+        }}
+        .case-info {{
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1);
+            padding: 25px;
+            border-radius: 20px;
+            margin-bottom: 30px;
+            color: white;
+        }}
+        .case-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 15px;
+        }}
+        .case-item {{
+            background: rgba(255,255,255,0.1);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+        }}
+        .evidence-grid {{ 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); 
+            gap: 25px; 
+        }}
+        .evidence-card {{
+            background: white;
+            border-radius: 20px;
+            overflow: hidden;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border-top: 5px solid;
+        }}
+        .evidence-card:hover {{
+            transform: translateY(-8px);
+            box-shadow: 0 25px 50px rgba(0,0,0,0.3);
+        }}
+        .evidence-card.critical {{ border-top-color: #dc2626; }}
+        .evidence-card.important {{ border-top-color: #ea580c; }}
+        .evidence-card.useful {{ border-top-color: #0891b2; }}
+        .card-header {{
+            padding: 20px;
+            background: linear-gradient(135deg, #f8fafc, #e2e8f0);
+            border-bottom: 1px solid #e5e7eb;
+        }}
+        .evidence-id {{
+            font-size: 0.9em;
+            color: #6b7280;
+            margin-bottom: 5px;
+        }}
+        .evidence-title {{
+            font-size: 1.1em;
+            font-weight: bold;
+            color: #1f2937;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            line-height: 1.3;
+        }}
+        .evidence-meta {{
+            font-size: 0.9em;
+            color: #6b7280;
+        }}
+        .card-content {{
+            padding: 20px;
+        }}
+        .data-item {{
+            background: #f8fafc;
+            padding: 10px;
+            margin: 6px 0;
+            border-radius: 6px;
+            border-left: 3px solid #e5e7eb;
+            font-size: 0.9em;
+            line-height: 1.4;
+        }}
+        .korean-data {{
+            background: linear-gradient(135deg, #fef3c7, #fde68a);
+            border-left-color: #f59e0b;
+            font-weight: 500;
+        }}
+        .email-data {{
+            background: linear-gradient(135deg, #dbeafe, #bfdbfe);
+            border-left-color: #3b82f6;
+        }}
+        .priority-badge {{
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 15px;
+            font-size: 0.75em;
+            font-weight: bold;
+            color: white;
+            white-space: nowrap;
+        }}
+        .priority-critical {{ background: #dc2626; }}
+        .priority-important {{ background: #ea580c; }}
+        .priority-useful {{ background: #0891b2; }}
+        .timestamp {{
+            font-size: 0.8em;
+            color: #9ca3af;
+            margin-top: 5px;
+        }}
+        .data-count {{
+            background: #1f2937;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            margin-left: auto;
+        }}
+        .evidence-summary {{
+            background: rgba(255,255,255,0.05);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1);
+            padding: 20px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            color: white;
+            text-align: center;
+        }}
+        .forensic-note {{
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 0.9em;
+        }}
+        .forensic-critical {{ background: #fef2f2; }}
+        .forensic-important {{ background: #fef7ed; }}
+        .forensic-useful {{ background: #eff6ff; }}
+    </style>
+</head>
+<body>
+    <div class="evidence-container">
+        <div class="header">
+            <h1>🔍 디지털 포렌식 증거 분석</h1>
+            <h2>Wear OS 스마트워치</h2>
+        </div>
+        
+        <div class="case-info">
+            <h3>📋 사건 개요</h3>
+            <div class="case-grid">
+                <div class="case-item">
+                    <strong>피의자 계정</strong><br>
+                    {main_account or "계정 미확인"}
+                </div>
+                <div class="case-item">
+                    <strong>분석 DB 수</strong><br>
+                    {total_dbs}개
+                </div>
+                <div class="case-item">
+                    <strong>주요 증거</strong><br>
+                    {len(evidence_items)}개 아이템
+                </div>
+                <div class="case-item">
+                    <strong>한글 데이터</strong><br>
+                    {total_korean_chars}자
+                </div>
+            </div>
+        </div>
+        
+        <div class="evidence-summary">
+            <h3>🎯 핵심 증거 요약</h3>
+            <p>총 {len(evidence_items)}개의 주요 증거가 발견되었으며, 한국어 텍스트 {korean_tables}개 테이블과 이메일 관련 {email_tables}개 테이블에서 포렌식적 가치가 확인됨</p>
+        </div>
+        
+        <div class="evidence-grid">"""
+
+    # 각 증거 카드 생성
+    for item in evidence_items:
+        priority_class = "critical" if item["priority"] == 1 else "important" if item["priority"] == 2 else "useful"
+        priority_text = "핵심증거" if item["priority"] == 1 else "중요증거" if item["priority"] == 2 else "참고증거"
+        
+        # 앱 이름에 따른 아이콘
+        app_icon = "💬" if "messaging" in item["category"] else "📝" if "productivity" in item["category"] else "📧" if "email" in item["category"] else "📱"
+        
+        html_content += f"""
+            <div class="evidence-card {priority_class}">
+                <div class="card-header">
+                    <div class="evidence-id">Evidence #{item["id"]:03d}</div>
+                    <div class="evidence-title">
+                        {app_icon} {item["app_name"]}
+                        <span class="priority-badge priority-{priority_class}">{priority_text}</span>
+                    </div>
+                    <div class="evidence-meta">
+                        위치: /data/{item["db_path"]}
+                    </div>
+                </div>
+                <div class="card-content">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <strong>발견된 데이터</strong>
+                        <span class="data-count">{item["total_rows"]}건</span>
+                    </div>"""
+        
+        # 한글 데이터가 있는 경우
+        if item["korean_data"]:
+            html_content += """
+                    <div style="margin-bottom: 15px;">
+                        <strong>🇰🇷 한글 데이터</strong>
+                    </div>"""
+            
+            for table in item["korean_data"][:3]:  # 최대 3개 테이블만 표시
+                html_content += f"""
+                    <div class="data-item korean-data">
+                        <strong>{table["table"]}</strong> ({table["row_count"]}행)"""
+                
+                # 한글 텍스트 샘플 표시
+                korean_samples = []
+                for row in table.get("rows", [])[:3]:  # 최대 3개 행만
+                    for cell in row:
+                        cell_str = str(cell) if cell is not None else ""
+                        if has_korean_text(cell_str):
+                            text = cell_str[:100]  # 100자 제한
+                            if text and text not in korean_samples:
+                                korean_samples.append(f'"{text}"')
+                
+                if korean_samples:
+                    # 텍스트가 너무 길면 줄바꿈 방지를 위해 더 짧게 자르기
+                    short_samples = []
+                    for sample in korean_samples[:3]:
+                        if len(sample) > 50:
+                            short_samples.append(sample[:47] + '..."')
+                        else:
+                            short_samples.append(sample)
+                    
+                    html_content += f"""
+                        <div style="margin-top: 6px; font-size: 0.85em; line-height: 1.3; word-break: break-all;">
+                            {', '.join(short_samples)}
+                        </div>"""
+                
+                html_content += """
+                    </div>"""
+        
+        # 이메일 데이터가 있는 경우
+        if item["email_data"]:
+            html_content += """
+                    <div style="margin-bottom: 15px;">
+                        <strong>📧 이메일 관련 데이터</strong>
+                    </div>"""
+            
+            for table in item["email_data"][:2]:  # 최대 2개 테이블만 표시
+                html_content += f"""
+                    <div class="data-item email-data">
+                        <strong>{table["table"]}</strong> ({table["row_count"]}행)"""
+                
+                # 이메일 주소 샘플 표시
+                email_samples = []
+                for row in table.get("rows", [])[:5]:  # 최대 5개 행만
+                    for cell in row:
+                        cell_str = str(cell) if cell is not None else ""
+                        emails = extract_emails(cell_str)
+                        for email in emails:
+                            if email and email not in email_samples:
+                                email_samples.append(email)
+                
+                if email_samples:
+                    html_content += f"""
+                        <div style="margin-top: 8px; font-size: 0.9em;">
+                            {', '.join(email_samples[:5])}
+                        </div>"""
+                
+                html_content += """
+                    </div>"""
+        
+        # 기타 중요 데이터
+        if item["important_tables"] and not item["korean_data"] and not item["email_data"]:
+            html_content += """
+                    <div style="margin-bottom: 15px;">
+                        <strong>📊 주요 테이블</strong>
+                    </div>"""
+            
+            for table in item["important_tables"][:3]:
+                html_content += f"""
+                    <div class="data-item">
+                        <strong>{table["table"]}</strong> ({table["row_count"]}행)
+                    </div>"""
+        
+        # 포렌식 의미 설명
+        forensic_class = f"forensic-{priority_class}"
+        forensic_meaning = ""
+        
+        if item["korean_data"]:
+            forensic_meaning = "사용자의 한국어 텍스트 입력 패턴 및 개인 정보 확인 가능"
+        elif item["email_data"]:
+            forensic_meaning = "계정 연동 정보 및 외부 서비스 이용 현황 파악 가능"
+        elif "messaging" in item["category"]:
+            forensic_meaning = "메시징 활동 및 커뮤니케이션 패턴 분석 가능"
+        elif "productivity" in item["category"]:
+            forensic_meaning = "개인 메모 및 업무 관련 활동 내역 확인 가능"
+        else:
+            forensic_meaning = "시스템 사용 패턴 및 앱 활동 로그 분석 가능"
+        
+        html_content += f"""
+                    <div class="{forensic_class} forensic-note">
+                        📍 <strong>포렌식 의미:</strong> {forensic_meaning}
+                    </div>
+                </div>
+            </div>"""
+    
+    # HTML 마무리
+    html_content += f"""
+        </div>
+        
+        <div style="background: rgba(255,255,255,0.05); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); padding: 25px; border-radius: 20px; margin-top: 30px; color: white; text-align: center;">
+            <h3>📊 증거 분석 결론</h3>
+            <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+                <div>
+                    <div style="font-size: 2em; font-weight: bold; color: #fbbf24;">{len(evidence_items)}</div>
+                    <div>주요 증거 그룹</div>
+                </div>
+                <div>
+                    <div style="font-size: 2em; font-weight: bold; color: #fbbf24;">{total_rows:,}</div>
+                    <div>총 데이터 건수</div>
+                </div>
+                <div>
+                    <div style="font-size: 2em; font-weight: bold; color: #fbbf24;">{total_korean_chars}</div>
+                    <div>한글 문자 수</div>
+                </div>
+                <div>
+                    <div style="font-size: 2em; font-weight: bold; color: #fbbf24;">{total_emails}</div>
+                    <div>이메일 주소 수</div>
+                </div>
+            </div>
+            <div style="margin-top: 20px; padding: 15px; background: rgba(59, 130, 246, 0.2); border-radius: 10px;">
+                <strong>권고사항:</strong> 휴대폰 본체 및 클라우드 동기화 데이터 추가 분석 필요
+            </div>
+        </div>
+    </div>
+</body>
+</html>"""
+    
+    # HTML 파일 저장
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
 def generate_markdown_report(db_summaries, output_path, mount_point):
-    """개선된 마크다운 보고서 생성 - 포렌식적으로 의미있는 데이터만 포함, 한글 데이터 최우선"""
+    """간소화된 백업용 마크다운 보고서 생성"""
     app_categories = get_app_categories()
     
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("# Wear OS 서드파티 앱 DB 아티팩트 분석 리포트\n\n")
-        f.write("이 보고서는 **포렌식적으로 의미있는** 서드파티 앱의 데이터베이스 테이블만을 분석한 결과입니다.\n")
-        f.write("**한글 데이터와 이메일 주소가 포함된 테이블만 표시됩니다.**\n\n")
+        f.write("# Wear OS 서드파티 앱 DB 분석 백업 리포트\n\n")
+        f.write("이 파일은 HTML 보고서의 백업용 마크다운 버전입니다.\n\n")
         
-        # 요약 섹션
-        f.write("## 📊 분석 요약\n\n")
+        # 간단한 통계만 포함
         total_dbs = len(db_summaries)
-        
-        # 통계 계산
         total_tables = 0
         tables_with_data = 0
-        total_rows = 0
-        korean_tables = 0
-        email_tables = 0
-        forensic_relevant_tables = 0
         
         for db_file, tables in db_summaries.items():
             for table_info in tables:
                 if table_info.get('table') not in ['DB_ERROR', 'COPY_ERROR']:
                     total_tables += 1
-                    row_count = table_info.get('row_count', 0)
-                    if row_count > 0:
+                    if table_info.get('row_count', 0) > 0:
                         tables_with_data += 1
-                        total_rows += row_count
-                        
-                        # 포렌식 관련성 및 한글/이메일 데이터 통계
-                        if table_info.get('has_korean', False):
-                            korean_tables += 1
-                        if table_info.get('has_email', False):
-                            email_tables += 1
-                        if table_info.get('forensic_priority', 0) > 0:
-                            forensic_relevant_tables += 1
         
-        # 카테고리별 통계
-        category_stats = {}
-        for db_file, tables in db_summaries.items():
-            rel_path = os.path.relpath(db_file, os.path.join(mount_point, "data"))
-            app_name = rel_path.split('/')[0]
-            
-            category = "기타"
-            for cat, info in app_categories.items():
-                if any(app_pattern in app_name for app_pattern in info["apps"]):
-                    category = cat
-                    break
-            
-            if category not in category_stats:
-                category_stats[category] = 0
-            category_stats[category] += 1
-        
-        f.write(f"- **총 분석된 DB 파일**: {total_dbs}개\n")
-        f.write(f"- **총 테이블 수**: {total_tables}개\n")
-        f.write(f"- **데이터가 있는 테이블**: {tables_with_data}개 ({tables_with_data/total_tables*100:.1f}%)\n")
-        f.write(f"- **포렌식 관련 테이블**: {forensic_relevant_tables}개 ⭐\n")
-        f.write(f"- **한글 데이터 포함 테이블**: {korean_tables}개 🇰🇷\n")
-        f.write(f"- **이메일 주소 포함 테이블**: {email_tables}개 📧\n")
-        f.write(f"- **총 데이터 레코드**: {total_rows:,}개\n\n")
-        
-        for category, count in sorted(category_stats.items()):
-            f.write(f"- **{category.title()}**: {count}개 DB\n")
-        f.write("\n")
-        
-        # 카테고리별로 정렬해서 출력
-        categorized_dbs = {}
-        for db_file, tables in db_summaries.items():
-            rel_path = os.path.relpath(db_file, os.path.join(mount_point, "data"))
-            app_name = rel_path.split('/')[0]
-            
-            category = "기타"
-            priority = 5
-            for cat, info in app_categories.items():
-                if any(app_pattern in app_name for app_pattern in info["apps"]):
-                    category = cat
-                    priority = info["priority"]
-                    break
-            
-            if category not in categorized_dbs:
-                categorized_dbs[category] = []
-            categorized_dbs[category].append((db_file, tables, priority))
-        
-        # 우선순위 순으로 카테고리 정렬
-        sorted_categories = sorted(categorized_dbs.items(), 
-                                 key=lambda x: min(item[2] for item in x[1]))
-        
-        for category, db_list in sorted_categories:
-            f.write(f"## 📱 {category.title()} 앱\n\n")
-            
-            # 해당 카테고리 내에서도 우선순위 정렬
-            sorted_db_list = sorted(db_list, key=lambda x: x[2])
-            
-            for db_file, tables, priority in sorted_db_list:
-                rel_db_path = os.path.relpath(db_file, os.path.join(mount_point, "data"))
-                app_name = rel_db_path.split('/')[0]
-                
-                # 한글/이메일 데이터가 있는 테이블들만 필터링
-                korean_tables_with_data = []
-                email_tables_with_data = []
-                other_relevant_tables = []
-                
-                for table_info in tables:
-                    # 오류 테이블이거나 데이터가 없는 테이블은 건너뛰기
-                    if table_info.get('table') in ['DB_ERROR', 'COPY_ERROR']:
-                        continue
-                    
-                    row_count = table_info.get('row_count', 0)
-                    has_data = row_count > 0
-                    forensic_priority = table_info.get('forensic_priority', 0)
-                    
-                    # 한글/이메일 데이터가 없는 테이블은 제외
-                    if not has_data or not (table_info.get('has_korean', False) or table_info.get('has_email', False)):
-                        continue
-                    
-                    if table_info.get('has_korean', False):
-                        korean_tables_with_data.append(table_info)
-                    elif table_info.get('has_email', False):
-                        email_tables_with_data.append(table_info)
-                    else:
-                        other_relevant_tables.append(table_info)
-                
-                # 한글/이메일 데이터가 있는 테이블이 하나도 없으면 이 DB는 건너뛰기
-                if not korean_tables_with_data and not email_tables_with_data and not other_relevant_tables:
-                    continue
-                
-                # 우선순위 표시
-                priority_marker = {1: "🔥 고우선순위", 2: "⭐ 중우선순위", 3: "📍 저우선순위"}.get(priority, "")
-                
-                f.write(f"### {priority_marker} `/data/{rel_db_path}`\n\n")
-                f.write(f"**앱**: `{app_name}`\n")
-                
-                # 테이블 통계 표시
-                total_relevant_tables = len(korean_tables_with_data) + len(email_tables_with_data) + len(other_relevant_tables)
-                total_rows_in_db = sum(t.get('row_count', 0) for t in korean_tables_with_data + email_tables_with_data + other_relevant_tables)
-                f.write(f"**한글/이메일 데이터 테이블**: {total_relevant_tables}개 ({total_rows_in_db:,}행)\n")
-                
-                if korean_tables_with_data:
-                    f.write(f"**한글 데이터 테이블**: {len(korean_tables_with_data)}개 🇰🇷\n")
-                if email_tables_with_data:
-                    f.write(f"**이메일 데이터 테이블**: {len(email_tables_with_data)}개 📧\n")
-                f.write("\n")
-                
-                # 한글 데이터 테이블을 최우선으로 표시
-                if korean_tables_with_data:
-                    f.write("#### 🇰🇷 한글 데이터 테이블\n\n")
-                    for info in korean_tables_with_data:
-                        write_table_info(f, info, is_korean=True)
-                
-                # 이메일 데이터 테이블 표시
-                if email_tables_with_data:
-                    f.write("#### 📧 이메일 데이터 테이블\n\n")
-                    for info in email_tables_with_data:
-                        write_table_info(f, info, is_email=True)
-                
-                f.write("---\n\n")
-
-def write_table_info(f, info, is_korean=False, is_email=False):
-    """테이블 정보를 마크다운으로 작성 - 한글/이메일 데이터가 있는 테이블만"""
-    table_name = info['table']
-    row_count = info.get('row_count', 0)
-    korean_count = info.get('korean_count', 0)
-    email_count = info.get('email_count', 0)
-    
-    # 한글/이메일 데이터 표시
-    if is_korean:
-        marker = "🇰🇷 "
-        info_text = f" (한글 {korean_count}자)" if korean_count > 0 else ""
-    elif is_email:
-        marker = "📧 "
-        info_text = f" (이메일 {email_count}개)" if email_count > 0 else ""
-    else:
-        marker = ""
-        info_text = ""
-    
-    f.write(f"##### {marker}테이블: `{table_name}` ({row_count}행{info_text})\n\n")
-    
-    if not info["columns"]:
-        f.write("_컬럼 정보 없음 또는 오류 발생_\n\n")
-        if info["rows"]:
-            for row in info["rows"]:
-                f.write(f"**오류**: {row}\n\n")
-        return
-    
-    # 데이터가 있는 경우에만 테이블 표시
-    if info["rows"] and len(info["rows"]) > 0:
-        # 테이블 헤더
-        f.write("| " + " | ".join(info["columns"]) + " |\n")
-        f.write("| " + " | ".join(["---"] * len(info["columns"])) + " |\n")
-        
-        # 데이터 행들
-        for row in info["rows"]:
-            row_str = []
-            for col in row:
-                if col is None:
-                    row_str.append("NULL")
-                else:
-                    # 마크다운 특수문자 이스케이프 및 길이 제한
-                    col_str = str(col).replace("|", "\\|").replace("\n", " ").replace("\r", "")
-                    if len(col_str) > 50:
-                        col_str = col_str[:47] + "..."
-                    row_str.append(col_str)
-            f.write("| " + " | ".join(row_str) + " |\n")
-    else:
-        # 데이터가 없는 경우 간단한 메시지만
-        f.write("_데이터 없음 (테이블 스키마만 존재)_\n")
-    
-    f.write("\n")
+        f.write(f"## 📊 요약\n\n")
+        f.write(f"- 총 DB 파일: {total_dbs}개\n")
+        f.write(f"- 총 테이블: {total_tables}개\n") 
+        f.write(f"- 데이터 보유 테이블: {tables_with_data}개\n\n")
+        f.write(f"상세 분석 결과는 HTML 보고서를 참조하세요.\n")
 
 def main():
     home = os.path.expanduser("~")
@@ -854,11 +1138,13 @@ def main():
         sys.exit(1)
     
     mount_point = os.path.join(home, "mnt")
-    output_md = os.path.join(home, "wearos_thirdparty_artifact_report.md")
+    output_html = os.path.join(home, "wearos_forensic_evidence_report.html")
+    output_md = os.path.join(home, "wearos_thirdparty_artifact_report_backup.md")
     
     print(f"[INFO] 분석 대상 이미지 파일: {img_file}")
     print(f"[INFO] 임시 마운트 경로: {mount_point}")
-    print(f"[INFO] 결과 보고서: {output_md}")
+    print(f"[INFO] HTML 보고서: {output_html}")
+    print(f"[INFO] 백업 마크다운: {output_md}")
     
     # 임시 디렉토리 생성 (DB 파일 복사용)
     temp_dir = tempfile.mkdtemp(prefix="wearos_db_")
@@ -939,8 +1225,20 @@ def main():
             
             db_summaries[db] = analyze_sqlite_db(db, app_name=app_name, temp_dir=temp_dir)
         
-        generate_markdown_report(db_summaries, output_md, mount_point)
-        print(f"\n[+] 서드파티 앱 중심 분석 및 보고서 완료: {output_md}")
+        # HTML 증거 카드형 보고서 생성
+        generate_html_report(db_summaries, output_html, mount_point)
+        print(f"\n[+] 🎯 HTML 포렌식 증거 보고서 완료: {output_html}")
+        
+        # 백업용 마크다운도 생성 (간소화)
+        try:
+            generate_markdown_report(db_summaries, output_md, mount_point)
+            print(f"[+] 📄 백업 마크다운 보고서 완료: {output_md}")
+        except Exception as e:
+            print(f"[경고] 백업 마크다운 생성 실패: {e}")
+        
+        print(f"\n🔍 주요 결과:")
+        print(f"  - HTML 보고서를 브라우저에서 열어 시각적 분석 결과를 확인하세요")
+        print(f"  - 증거 카드 형식으로 포렌식 분석 결과가 정리되었습니다")
         
     finally:
         umount_img(mount_point)
@@ -952,4 +1250,4 @@ def main():
             print(f"[+] 임시 디렉토리 정리 완료")
 
 if __name__ == "__main__":
-    main() 
+    main()
